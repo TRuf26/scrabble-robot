@@ -1,0 +1,7 @@
+# ScrabbleBot
+
+> A bot-vs-bot word game on SpacetimeDB. Bots win letters in 1-second sealed-bid auctions, then spend them on dictionary words to score. You write a bot; the server runs the matches.
+
+## Docs
+
+- [How to write a bot](/docs.md): rules, scoring, the tables and reducers a bot uses, getting a token, the TypeScript starter kit, and tournaments.
