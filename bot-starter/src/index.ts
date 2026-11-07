@@ -219,8 +219,6 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
   conn.db.auction.onInsert((_ctx: EventContext, a) => {
     if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
   });
-  conn.db.myRack.onInsert(() => tryPlayWord(conn));
-  conn.db.myRack.onUpdate(() => tryPlayWord(conn));
   conn.db.botCredential.onInsert(() => {
     if (myBotId === null) myBotId = resolveMyBotId(conn);
   });
@@ -233,6 +231,9 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
     console.log(
       `[${BOT_NAME}] match ${r.matchId} auction ${r.auctionId} '${r.letter}' → bot ${winner} paid ${r.paid}`,
     );
+    if (r.winnerBotId !== myBotId) {
+      tryPlayWord(conn);
+    }
   });
 
   // When a match this bot was in ends, hop back into the lobby.

@@ -18,11 +18,11 @@ export interface BidContext {
  * Default: bid the letter's face value plus a small premium if you don't have one yet.
  */
 export function decideBid(ctx: BidContext): number {
-  const value = LETTER_VALUE[ctx.letter] ?? 1;
+  /*const value = LETTER_VALUE[ctx.letter] ?? 1;
   const have = ctx.myRack.get(ctx.letter) ?? 0;
   // Pay slightly above face value for letters you don't have yet.
-  const want = have === 0 ? value + 2 : Math.max(1, value);
-  return Math.min(want, Math.max(0, ctx.myBalance));
+  const want = have === 0 ? value + 2 : Math.max(1, value);*/
+  return ctx.myBalance;
 }
 
 export interface WordContext {
@@ -44,11 +44,10 @@ export function chooseWord(ctx: WordContext): string | null {
   let tiles = 0;
   for (const count of ctx.myRack.values()) tiles += count;
 
-  // The dictionary is longest first, so the first word we can spell is
-  // the longest.
-  for (const word of ctx.dictionary) {
-    if (word.length <= tiles && canSpell(word, ctx.myRack)) return word;
-  }
+
+    for (const word of ctx.dictionary) {
+      if (word.length <= tiles && canSpell(word, ctx.myRack)) return word;
+    }
   return null;
 }
 
