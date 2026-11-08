@@ -27,7 +27,16 @@ import {
 import { Identity } from "spacetimedb";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { chooseWord, decideBid } from "./strategy.js";
+
+import {
+  LETTER_VALUE,
+  decideBid,
+  initStrategy,
+  planWords,
+  type GameInfo,
+  type Opponent,
+  type SimKind,
+} from "./strategy.js";
 
 const HOST = process.env.STDB_HOST ?? "https://maincloud.spacetimedb.com";
 const DB_NAME = process.env.STDB_DB ?? "scrabblebot";
@@ -64,6 +73,48 @@ const DICTIONARY: string[] = fs.existsSync(dictionaryPath)
       .filter((l) => l.length >= 2)
   : [];
 DICTIONARY.sort((a, b) => b.length - a.length); // longest first for greedy pick
+initStrategy(DICTIONARY); // builds the fast word index once (~1 s)
+
+const STANDARD_BAG: Record<string, number> = {
+  A: 9, B: 2, C: 2, D: 4, E: 12, F: 2, G: 3, H: 2, I: 9, J: 1, K: 1, L: 4,
+  M: 2, N: 6, O: 8, P: 2, Q: 1, R: 6, S: 4, T: 6, U: 4, V: 2, W: 2, X: 1,
+  Y: 2, Z: 1,
+};
+
+// ---------- Opponent memory ----------
+// After each match the module publishes every auction's top bid. For real
+// (non-sim) bots that won, we record how far over face value they bid, and
+// keep it on disk so the bot gets better at reading rivals over time.
+const MEMORY_PATH = path.join(process.cwd(), `.opponents-${BOT_NAME}.json`);
+type Memory = Record<string, number[]>; // botId -> recent (topBid - face)
+let memory: Memory = {};
+try {
+  memory = JSON.parse(fs.readFileSync(MEMORY_PATH, "utf8"));
+} catch {
+  memory = {};
+}
+let memoryDirty = false;
+function remember(botId: string, offset: number) {
+  const xs = (memory[botId] ??= []);
+  xs.push(offset);
+  if (xs.length > 200) xs.splice(0, xs.length - 200);
+  memoryDirty = true;
+}
+setInterval(() => {
+  if (!memoryDirty) return;
+  memoryDirty = false;
+  try {
+    fs.writeFileSync(MEMORY_PATH, JSON.stringify(memory));
+  } catch {}
+}, 5000).unref();
+function bidModel(botId: string): Opponent["bidModel"] {
+  const xs = memory[botId];
+  if (!xs || xs.length < 5) return undefined;
+  const s = [...xs].sort((a, b) => a - b);
+  const med = s[Math.floor(s.length / 2)]!;
+  const p85 = s[Math.floor(s.length * 0.85)]!;
+  return { offset: med, spread: Math.max(1, p85 - med + 1) };
+}
 
 let myIdentity: Identity | null = null;
 let myBotId: bigint | null = null;
@@ -113,6 +164,91 @@ function logFailure(what: string) {
     );
 }
 
+const add = (m: Map<string, number>, k: string, n = 1) =>
+  m.set(k, (m.get(k) ?? 0) + n);
+
+// Everything public about a running match, in the shape the strategy wants.
+function buildGame(conn: DbConnection, matchId: bigint): GameInfo | null {
+  const m = conn.db.matchState.id.find(matchId);
+  if (!m || myBotId === null) return null;
+  const won = new Map<string, Map<string, number>>();
+  const played = new Map<string, Map<string, number>>();
+  const auctioned = new Map<string, number>();
+  for (const a of conn.db.auction.iter()) {
+    if (a.matchId === matchId) add(auctioned, a.letter);
+  }
+  for (const r of conn.db.auctionResult.iter()) {
+    if (r.matchId !== matchId || r.winnerBotId == null) continue;
+    const k = String(r.winnerBotId);
+    if (!won.has(k)) won.set(k, new Map());
+    add(won.get(k)!, r.letter);
+  }
+  for (const w of conn.db.wordPlay.iter()) {
+    if (w.matchId !== matchId) continue;
+    const k = String(w.botId);
+    if (!played.has(k)) played.set(k, new Map());
+    for (const c of w.word) add(played.get(k)!, c);
+  }
+  const me = String(myBotId);
+  // My starting tiles = what I hold + what I've played - what I've won.
+  const myStart = new Map<string, number>();
+  const rack = rackForMatch(conn, matchId);
+  for (const c of Object.keys(STANDARD_BAG)) {
+    const n =
+      (rack.get(c) ?? 0) +
+      (played.get(me)?.get(c) ?? 0) -
+      (won.get(me)?.get(c) ?? 0);
+    if (n > 0) myStart.set(c, n);
+  }
+  const opponents: Opponent[] = [];
+  let myScore = 0;
+  for (const p of conn.db.matchParticipant.iter()) {
+    if (p.matchId !== matchId) continue;
+    const id = String(p.botId);
+    if (id === me) {
+      myScore = Number(p.score);
+      continue;
+    }
+    const bot = conn.db.bot.id.find(p.botId);
+    const known = new Map<string, number>();
+    for (const [c, n] of won.get(id) ?? []) {
+      const k = n - (played.get(id)?.get(c) ?? 0);
+      if (k > 0) known.set(c, k);
+    }
+    opponents.push({
+      botId: id,
+      balance: Number(p.balance),
+      score: Number(p.score),
+      sim: bot?.isSimulated ? (bot.strategy.tag as SimKind) : undefined,
+      knownRack: known,
+      bidModel: bot?.isSimulated ? undefined : bidModel(id),
+    });
+  }
+  // Unseen = full bag - every auctioned letter - my start tiles - rivals'
+  // start tiles they've revealed by playing more than they won.
+  const unseen = new Map<string, number>();
+  for (const [c, n] of Object.entries(STANDARD_BAG)) {
+    let seen = (auctioned.get(c) ?? 0) + (myStart.get(c) ?? 0);
+    for (const o of opponents) {
+      seen += Math.max(
+        0,
+        (played.get(o.botId)?.get(c) ?? 0) - (won.get(o.botId)?.get(c) ?? 0),
+      );
+    }
+    unseen.set(c, Math.max(0, n - seen));
+  }
+  return {
+    auctionsLeft: m.bagTotal,
+    auctionType: m.auctionType.tag === "FirstPrice" ? "FirstPrice" : "Vickrey",
+    unseen,
+    opponents,
+    myScore,
+  };
+}
+
+// Our live bid per open auction, so we can raise it after a word pays out.
+const myBids = new Map<string, number>();
+
 function tryBid(
   conn: DbConnection,
   auctionId: bigint,
@@ -121,23 +257,42 @@ function tryBid(
 ) {
   if (myBotId === null) return;
   const key = `${matchId}:${auctionId}`;
-  if (bidsByAuction.has(key)) return;
+  const a = conn.db.auction.id.find(auctionId);
+  if (!a || a.status.tag !== "Open") return;
   const participant = participantForMatch(conn, matchId);
   if (!participant) return;
+  const game = buildGame(conn, matchId);
+  if (!game) return;
   const amount = decideBid({
     letter,
     myBalance: participant.balance,
     myRack: rackForMatch(conn, matchId),
+    dictionary: DICTIONARY,
+    game,
   });
-  if (amount <= 0) return;
+  const prev = myBids.get(key);
+  if (prev === amount || (prev === undefined && amount <= 0)) return;
+  myBids.set(key, amount);
+  bidsByAuction.add(key);
   conn.reducers
     .submitBid({ auctionId, amount: BigInt(amount) })
     .catch(logFailure(`bid on auction ${auctionId}`));
-  bidsByAuction.add(key);
   console.log(
-    `[${BOT_NAME}] bid ${amount} on '${letter}' (match ${matchId}, auction ${auctionId})`,
+    `[${BOT_NAME}] ${prev === undefined ? "bid" : "rebid"} ${amount} on '${letter}' (match ${matchId}, ${game.auctionsLeft} left)`,
   );
 }
+
+function rebidOpen(conn: DbConnection, matchId: bigint) {
+  for (const a of conn.db.auction.iter()) {
+    if (a.matchId === matchId && a.status.tag === "Open") {
+      tryBid(conn, a.id, a.matchId, a.letter);
+    }
+  }
+}
+
+// Words we've sent but the server hasn't confirmed, per match.
+const inFlight = new Map<string, number>();
+const recheck = new Map<string, ReturnType<typeof setTimeout>>();
 
 function tryPlayWord(conn: DbConnection) {
   if (myBotId === null) return;
@@ -152,18 +307,161 @@ function tryPlayWord(conn: DbConnection) {
   const now = Date.now();
   for (const matchId of matches) {
     const key = String(matchId);
-    if (now - (lastWordAttemptByMatch.get(key) ?? 0) < WORD_RETRY_MS) continue;
-    lastWordAttemptByMatch.set(key, now);
-    const word = chooseWord({
+    if ((inFlight.get(key) ?? 0) > 0) continue;
+    const since = now - (lastWordAttemptByMatch.get(key) ?? 0);
+    if (since < WORD_RETRY_MS) {
+      // Don't drop the check: run it as soon as the throttle allows.
+      if (!recheck.has(key)) {
+        recheck.set(
+          key,
+          setTimeout(() => {
+            recheck.delete(key);
+            tryPlayWord(conn);
+          }, WORD_RETRY_MS - since + 5),
+        );
+      }
+      continue;
+    }
+    const game = buildGame(conn, matchId);
+    const participant = participantForMatch(conn, matchId);
+    if (!game || !participant) continue;
+    const words = planWords({
       myRack: rackForMatch(conn, matchId),
       dictionary: DICTIONARY,
+      myBalance: participant.balance,
+      game,
     });
-    if (!word) continue;
-    console.log(`[${BOT_NAME}] match ${matchId}: playing '${word}'`);
-    conn.reducers
-      .submitWord({ matchId, word })
-      .catch(logFailure(`playing '${word}'`));
+    if (!words.length) continue;
+    lastWordAttemptByMatch.set(key, now);
+    inFlight.set(key, words.length);
+    for (const word of words) {
+      console.log(`[${BOT_NAME}] match ${matchId}: playing '${word}'`);
+      conn.reducers
+        .submitWord({ matchId, word })
+        .catch(logFailure(`playing '${word}'`))
+        .finally(() => {
+          const left = (inFlight.get(key) ?? 1) - 1;
+          inFlight.set(key, left);
+          if (left <= 0) {
+            // The payout is in: spend it on the open auction if worth it.
+            rebidOpen(conn, matchId);
+            tryPlayWord(conn);
+          }
+        });
+    }
   }
+}
+
+// ---------- Narrow subscriptions ----------
+// subscribeToAllTables() downloads every match, auction and word ever played
+// into the client cache, which runs Node out of memory. Instead:
+//   1. small "core" tables (my credential, my rack, bots, lobby)
+//   2. my own match_participant rows, to learn which matches I'm in
+//   3. full detail only for my latest / newly joined match, dropped when it ends
+// NOTE: table/column names are snake_case as in the module. If a query errors,
+// check the names in src/module_bindings/.
+type SubHandle = { unsubscribe: () => void };
+const watchedMatches = new Map<string, SubHandle>();
+
+function subErr(what: string) {
+  return (_ctx: unknown, err?: unknown) =>
+    console.error(`[${BOT_NAME}] subscription '${what}' failed:`, err ?? _ctx);
+}
+
+function watchMatch(conn: DbConnection, matchId: bigint) {
+  const key = String(matchId);
+  if (watchedMatches.has(key)) return;
+  const id = matchId.toString();
+  const handle = conn
+    .subscriptionBuilder()
+    .onApplied(() => {
+      console.log(`[${BOT_NAME}] watching match ${id}`);
+      for (const a of conn.db.auction.iter()) {
+        if (a.matchId === matchId && a.status.tag === "Open")
+          tryBid(conn, a.id, a.matchId, a.letter);
+      }
+      tryPlayWord(conn);
+    })
+    .onError(subErr(`match ${id}`))
+    .subscribe([
+      `SELECT * FROM match_state WHERE id = ${id}`,
+      `SELECT * FROM match_participant WHERE match_id = ${id}`,
+      `SELECT * FROM auction WHERE match_id = ${id}`,
+      `SELECT * FROM auction_result WHERE match_id = ${id}`,
+      `SELECT * FROM word_play WHERE match_id = ${id}`,
+    ]);
+  watchedMatches.set(key, handle as unknown as SubHandle);
+}
+
+function unwatchMatch(matchId: bigint) {
+  const key = String(matchId);
+  const h = watchedMatches.get(key);
+  if (!h) return;
+  watchedMatches.delete(key);
+  // Give the end-of-match rows a moment to arrive before dropping them.
+  setTimeout(() => {
+    try {
+      h.unsubscribe();
+    } catch {}
+  }, 5000);
+}
+
+// ---------- One-off data dump (DUMP=1 npm start) ----------
+// Saves the last DUMP_MATCHES matches (default 2000, counted back from our
+// latest match) to dump.json for offline analysis, then drops that data
+// from the cache again so memory stays low.
+function dumpRecent(conn: DbConnection, latest: bigint) {
+  const n = BigInt(process.env.DUMP_MATCHES ?? "2000");
+  const from = latest > n ? latest - n : 0n;
+  console.log(`[${BOT_NAME}] dumping matches ${from + 1n}..${latest}…`);
+  const handle = conn
+    .subscriptionBuilder()
+    .onApplied(() => {
+      const inRange = (r: { matchId: bigint }) => r.matchId > from;
+      const data = {
+        auctions: [...conn.db.auctionResult.iter()].filter(inRange),
+        words: [...conn.db.wordPlay.iter()].filter(inRange),
+        players: [...conn.db.matchParticipant.iter()].filter(inRange),
+        bots: [...conn.db.bot.iter()],
+      };
+      fs.writeFileSync(
+        path.join(process.cwd(), "dump.json"),
+        JSON.stringify(data, (_k, v) => (typeof v === "bigint" ? Number(v) : v)),
+      );
+      console.log(
+        `[${BOT_NAME}] wrote dump.json (${data.auctions.length} auctions, ${data.words.length} words, ${data.players.length} player rows)`,
+      );
+      setTimeout(() => {
+        try {
+          (handle as unknown as SubHandle).unsubscribe();
+        } catch {}
+      }, 1000);
+    })
+    .onError(subErr("dump"))
+    .subscribe([
+      `SELECT * FROM auction_result WHERE match_id > ${from}`,
+      `SELECT * FROM word_play WHERE match_id > ${from}`,
+      `SELECT * FROM match_participant WHERE match_id > ${from}`,
+    ]);
+}
+
+function subscribeMine(conn: DbConnection, onReady: () => void) {
+  if (myBotId === null) return;
+  conn
+    .subscriptionBuilder()
+    .onApplied(() => {
+      // Only the most recent match can still be running for us.
+      let latest: bigint | null = null;
+      for (const p of conn.db.matchParticipant.iter()) {
+        if (p.botId === myBotId && (latest === null || p.matchId > latest))
+          latest = p.matchId;
+      }
+      if (latest !== null) watchMatch(conn, latest);
+      if (process.env.DUMP && latest !== null) dumpRecent(conn, latest);
+      onReady();
+    })
+    .onError(subErr("my matches"))
+    .subscribe([`SELECT * FROM match_participant WHERE bot_id = ${myBotId}`]);
 }
 
 function onConnect(conn: DbConnection, identity: Identity, token: string) {
@@ -171,8 +469,14 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
   saveToken(token);
   console.log(`[${BOT_NAME}] connected as ${identity.toHexString()}`);
 
+  // Matches we join later: start watching as soon as our row appears.
+  conn.db.matchParticipant.onInsert((_ctx, p) => {
+    if (myBotId !== null && p.botId === myBotId) watchMatch(conn, p.matchId);
+  });
+
   conn
     .subscriptionBuilder()
+    .onError(subErr("core"))
     .onApplied(() => {
       console.log(`[${BOT_NAME}] subscription applied`);
 
@@ -197,7 +501,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
             console.log(
               `[${BOT_NAME}] claimed credential for bot '${bot?.name ?? "?"}' (id ${myBotId})`,
             );
-            bootstrapActivity(conn);
+            subscribeMine(conn, () => bootstrapActivity(conn));
           }, 1000);
           return;
         } else {
@@ -212,12 +516,29 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
       console.log(
         `[${BOT_NAME}] acting as bot '${bot?.name ?? "?"}' (id ${myBotId})`,
       );
-      bootstrapActivity(conn);
+      subscribeMine(conn, () => bootstrapActivity(conn));
     })
-    .subscribeToAllTables();
+    .subscribe([
+      `SELECT * FROM bot_credential`,
+      `SELECT * FROM my_rack`,
+      `SELECT * FROM bot`,
+      `SELECT * FROM lobby`,
+      `SELECT * FROM lobby_member`,
+    ]);
 
   conn.db.auction.onInsert((_ctx: EventContext, a) => {
-    if (a.status.tag === "Open") tryBid(conn, a.id, a.matchId, a.letter);
+    if (a.status.tag !== "Open") return;
+    // Words first: on the final auction this cashes in the whole rack, and
+    // the payout funds a bigger bid.
+    tryPlayWord(conn);
+    tryBid(conn, a.id, a.matchId, a.letter);
+  });
+  conn.db.auctionTopBidArchive.onInsert((_ctx, top) => {
+    const r = conn.db.auctionResult.auctionId.find(top.auctionId);
+    if (!r || r.winnerBotId == null || r.winnerBotId === myBotId) return;
+    const bot = conn.db.bot.id.find(r.winnerBotId);
+    if (!bot || bot.isSimulated) return;
+    remember(String(r.winnerBotId), Number(top.topBid) - (LETTER_VALUE[r.letter] ?? 1));
   });
   conn.db.myRack.onInsert(() => tryPlayWord(conn));
   conn.db.myRack.onUpdate(() => tryPlayWord(conn));
@@ -239,6 +560,7 @@ function onConnect(conn: DbConnection, identity: Identity, token: string) {
   conn.db.matchState.onUpdate((_ctx, old, neu) => {
     if (myBotId === null) return;
     if (old.status.tag !== "Ended" && neu.status.tag === "Ended") {
+      unwatchMatch(neu.id);
       const wasIn = Array.from(conn.db.matchParticipant.iter()).some(
         (p) => p.matchId === neu.id && p.botId === myBotId,
       );
