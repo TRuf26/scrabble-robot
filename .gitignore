@@ -5,8 +5,39 @@ dist/
 target/
 .env.local
 .token-*
+
+# Bot starter bindings
+bot-starter/src/module_bindings/
+
+.vercel
+.env*
+
+# Ignore dependencies and secrets in subfolders
+**/node_modules/
+**/.env
+**/.env.*
+**/.token*
+**/.token-*
+
+# Backup
+scrabblebot-git-backup/<<<<<<< HEAD
+node_modules/
+dist/
+.DS_Store
+*.log
+target/
+.env.local
+.token-*
 # bot-starter bindings still ignored (regenerated per checkout). Web app's
 # bindings are tracked so the production build doesn't need spacetime CLI.
 bot-starter/src/module_bindings/
 .vercel
 .env*
+=======
+**/node_modules/
+**/.env
+**/.env.*
+**/.token*
+**/.token-*
+scrabblebot-git-backup/
+>>>>>>> kim
